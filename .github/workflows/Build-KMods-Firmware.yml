@@ -1,0 +1,186 @@
+name: Build Firmware With Kernel Modules
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [on-update]
+  push:
+    paths:
+      - config/immortal-kmods.config
+
+env:
+  REPO_URL: https://github.com/yhpgi/immortalwrt
+  REPO_BRANCH: bl201
+  CONFIG_FILE: config/immortal-kmods.config
+  BANNER: custom/banner
+  CONFIG_PACKAGE: custom/yhpgi
+  TZ: Asia/Jakarta
+
+jobs:
+  build-kmods-immortalwrt:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Check space usage
+        if: (!cancelled())
+        run: df -hT
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Check space usage
+        if: (!cancelled())
+        run: df -hT
+
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -qq update
+          sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /workdir
+          sudo chown $USER:$GROUPS /workdir
+
+      - name: Check space usage
+        if: (!cancelled())
+        run: df -hT
+
+      - name: Clone source code
+        working-directory: /workdir
+        run: |
+          df -hT $PWD
+          git clone -b $REPO_BRANCH --single-branch --depth 1 $REPO_URL openwrt
+          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+      - name: Check space usage
+        if: (!cancelled())
+        run: df -hT
+
+      - name: Copy custom files
+        run: |
+          cp -rf $BANNER openwrt/package/base-files/files/etc/banner
+          cp -rf $CONFIG_PACKAGE openwrt/package
+
+      - name: Update feeds
+        run: cd openwrt && ./scripts/feeds update -a
+
+      - name: Install feeds
+        run: cd openwrt && ./scripts/feeds install -a
+
+      - name: Copy configuration file
+        run: cp -rf $CONFIG_FILE openwrt/.config
+
+      - name: Check space usage
+        if: (!cancelled())
+        run: df -hT
+
+      - name: Download package
+        id: package
+        run: |
+          cd openwrt
+          make defconfig
+          make download -j8
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Check space usage
+        if: (!cancelled())
+        run: df -hT
+
+      - name: Compile the firmware
+        id: compile
+        run: |
+          cd openwrt
+          echo -e "$(($(nproc) + 1)) thread compile"
+          make -j$(($(nproc) + 1)) V=s || make -j1 || make -j1 V=s
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "COMPILE_DATE=$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+      - name: Check space usage
+        if: (!cancelled())
+        run: df -hT
+
+      - name: Add compile date to firmware names
+        if: steps.compile.outputs.status == 'success' && !cancelled()
+        run: |
+          cp -rf openwrt/bin/targets/ramips/mt7620/immortalwrt-ramips-mt7620-bolt_bl201-squashfs-sysupgrade.bin openwrt/bin/targets/ramips/mt7620/immortalwrt-ramips-mt7620-bolt_bl201-squashfs-sysupgrade-${{ env.COMPILE_DATE }}.bin
+          cp -rf openwrt/bin/targets/ramips/mt7620/immortalwrt-ramips-mt7620-bolt_bl201-initramfs-kernel.bin openwrt/bin/targets/ramips/mt7620/immortalwrt-ramips-mt7620-bolt_bl201-initramfs-kernel-${{ env.COMPILE_DATE }}.bin
+          cp -rf openwrt/bin/targets/ramips/mt7620/immortalwrt-ramips-mt7620-bolt_bl201.manifest openwrt/bin/targets/ramips/mt7620/immortalwrt-ramips-mt7620-bolt_bl201-${{ env.COMPILE_DATE }}.manifest
+          rm -rf openwrt/bin/targets/ramips/mt7620/immortalwrt-ramips-mt7620-bolt_bl201-squashfs-sysupgrade.bin
+          rm -rf openwrt/bin/targets/ramips/mt7620/immortalwrt-ramips-mt7620-bolt_bl201-initramfs-kernel.bin
+          rm -rf openwrt/bin/targets/ramips/mt7620/immortalwrt-ramips-mt7620-bolt_bl201.manifest
+
+      - name: Upload base packages to artifact
+        if: steps.compile.outputs.status == 'success' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-packages-${{ env.COMPILE_DATE }}
+          path: openwrt/bin/packages
+
+      - name: Upload target specific packages to artifact
+        if: steps.compile.outputs.status == 'success' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-packages-${{ env.COMPILE_DATE }}
+          path: openwrt/bin/targets/ramips/mt7620/packages
+          
+      - name: Upload firmware to artifact
+        if: steps.compile.outputs.status == 'success' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ env.COMPILE_DATE }}
+          path: openwrt/bin/targets/ramips/mt7620/*
+
+      - name: Organize compiled firmware for release
+        if: steps.compile.outputs.status == 'success' && !cancelled()
+        run: |
+          cp -rf openwrt/.config openwrt/bin/targets/ramips/mt7620/config
+          zip -r full-bin-output.zip openwrt/bin
+          cp -rf full-bin-output.zip openwrt/bin/targets/ramips/mt7620/full-bin-output-${{ env.COMPILE_DATE }}.zip
+          rm -rf openwrt/bin/targets/ramips/mt7620/packages
+          rm -rf openwrt/bin/targets/ramips/mt7620/*.buildinfo
+          rm -rf openwrt/bin/targets/ramips/mt7620/profiles.json
+
+      - name: Upload firmware to release
+        if: steps.compile.outputs.status == 'success' && !cancelled()
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file_glob: true
+          file: openwrt/bin/targets/ramips/mt7620/*
+          asset_name: ${{ github.event.repository.name }}-${{ github.sha }}
+          tag: bl201-immortalwrt-${{ env.COMPILE_DATE }}
+          body: |
+            ### Immortalwrt
+            - Default IP: 192.168.1.1
+            - Default username: root
+            - Default password: 
+          overwrite: true
+
+      - name: Delete workflow runs
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          retain_days: 0
+          keep_minimum_runs: 2
+
+      - name: Remove old releases
+        uses: dev-drprasad/delete-older-releases@master
+        with:
+          keep_latest: 4
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
